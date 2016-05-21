@@ -6,3 +6,8 @@ To provision and start a mariadb server, run:
 
     ./gradlew
 
+If you want to open a command line interface to maraidb, run:
+
+    ./mysql.sh
+
+On Windows, run all commands inside git bash.

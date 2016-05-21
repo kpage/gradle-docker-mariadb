@@ -1,0 +1,184 @@
+import com.bmuschko.gradle.docker.response.ResponseHandler
+import com.bmuschko.gradle.docker.tasks.container.*
+import com.bmuschko.gradle.docker.tasks.image.*
+
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.bmuschko:gradle-docker-plugin:2.6.6'
+    }
+}
+
+apply plugin: com.bmuschko.gradle.docker.DockerRemoteApiPlugin
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+}
+
+defaultTasks 'startDb'
+
+docker {
+    url = dockerHostUrl()
+}
+
+URI dockerHostEnv() {
+    String uri = System.getenv('DOCKER_HOST')
+    uri ? new URI(uri) : null
+}
+
+// https://github.com/bmuschko/gradle-docker-plugin/issues/97
+String dockerHostUrl() {
+    if (dockerHostEnv()) {
+        URI uri = dockerHostEnv()
+        if (uri.scheme == 'unix') {
+            uri
+        } else if (uri.scheme == 'tcp') {
+            (new URI(uri.scheme != 'tcp' ?: 'https' , uri.userInfo, uri.host, uri.port, uri.path, uri.query, uri.fragment)).toString()
+        }
+    } else {
+        org.gradle.internal.os.OperatingSystem.current().isLinux()
+                ? 'unix:///var/run/docker.sock'
+                : 'http://localhost:2375'
+    }
+}
+
+// Some gradle plugins create the build dir if it does not exist, but for our custom tasks we have to sometimes create it ourselves
+task ensureBuildDir() {
+    doLast {
+        if(!buildDir.exists()) {
+            if(!buildDir.mkdirs()) {
+                throw new GradleException("failed to make build directory")
+            }
+        }
+    }
+}
+
+// Just checks if something is running on port 3306 and times out after 1 second
+task checkIfDbRunning(type: Exec) {
+    commandLine './scripts/wait-for-it.sh', '--timeout=1', 'localhost:3306'
+    ignoreExitValue = true
+}
+
+def isDbRunning() {
+    if (!tasks.checkIfDbRunning.state.executed) {
+        throw new GradleException('isDbRunning() was called before checkIfDbRunning was run.')
+    }
+    return tasks.checkIfDbRunning.execResult.exitValue == 0
+}
+
+// If container already exists, skip download of image and container creation
+task checkContainerExistence(type: DockerCheckContainerExistence, dependsOn: checkIfDbRunning) {
+    // Don't read this property directly, use containerExists() to ensure that checkContainerExistence has run
+    ext.containerExists = false
+    targetContainerId { dockerDbContainerName }
+    setResponseHandler { containerExists ->
+        if (containerExists) {
+            ext.containerExists = true
+        }
+    }
+}
+
+def containerExists() {
+    if (!tasks.checkContainerExistence.state.executed) {
+        throw new GradleException('containerExists() was called before checkContainerExistence was run.')
+    }
+    return checkContainerExistence.ext.containerExists
+}
+
+// Downloads a small mariadb image from docker hub if it doesn't already exist.  We skip if the container already exists because this task has
+// a small delay even if the image is already downloaded.
+task downloadDbImage(type: DockerPullImage, dependsOn: checkContainerExistence) {
+    repository dockerDbImageRepository
+    tag dockerDbImageTag
+}
+tasks.downloadDbImage.onlyIf { !containerExists() }
+
+task prepareInitialDbScripts(type: Copy, dependsOn: [ensureBuildDir, checkContainerExistence]) {
+    from "$projectDir/$initDbScript"
+    into "$buildDir/initial-db-scripts"
+}
+tasks.prepareInitialDbScripts.onlyIf { !containerExists() }
+
+task createDbContainer(type: DockerCreateContainer, dependsOn: [checkContainerExistence, downloadDbImage, prepareInitialDbScripts]) {
+    targetImageId { "${dockerDbImageRepository}:${dockerDbImageTag}".toString() }
+    containerName = dockerDbContainerName
+    // Bind container port db to local port 3306, but do not expose outside host machine
+    portBindings = ['127.0.0.1:3306:3306']
+    // LANG=C.UTF-8 is required to get unicode support when connecting to the db on command line via docker run/exec.  Otherwise the lang is
+    // unset and viewing/entering Chinese characters or other non-ASCII characters is not supported.  The db still runs fine with unicode
+    // support without setting LANG here, this only affects opening a terminal from inside the container.
+    env = ["MYSQL_ROOT_PASSWORD=${mariaDbDevRootPwd}", "MYSQL_DATABASE=${mariaDbDatabaseName}", "MYSQL_USER=${mariaDbUsername}", "MYSQL_PASSWORD=${mariaDbPassword}", "LANG=C.UTF-8"]
+    // Sample configuration using project-specific my.conf and some initial db scripts
+    // TODO: test what happens when we clean buildDir, will that cause a problem inside the container?
+    binds = ["$projectDir/etc/mysql":'/etc/mysql/conf.d', "$buildDir/initial-db-scripts":"/docker-entrypoint-initdb.d"]
+}
+tasks.createDbContainer.onlyIf { !containerExists() }
+
+// This task will return when the container is first booted.  If you want to wait until the db is available, also depend on waitForDbStart
+task startDbWithoutWait(type: DockerStartContainer, dependsOn: [createDbContainer, checkIfDbRunning]) {
+    targetContainerId { dockerDbContainerName }
+}
+// No need to start db if already running
+tasks.startDbWithoutWait.onlyIf { !isDbRunning() }
+
+// Waits up to 30 minutes for db initialization (time can be increased/decreased depending on running time of initial scripts)
+// Will finish immediately if db is already available
+task waitForDbStart(type: DockerInspectContainer) {
+    targetContainerId { dockerDbContainerName }
+    setResponseHandler { container ->
+        def ip = container.networkSettings.ipAddress
+        exec {
+            // This checks port 3306 of the container rather than host machine.  This is because the port forwarding will be
+            // set up immediately on localhost even if the container has not yet exposed mariadb on port 3306.  If we check
+            // the localhost port 3306, it will be available immediately but mariadb will not be listening until it is
+            // initialized.
+            commandLine './scripts/wait-for-it.sh', '--timeout=1800', "$ip:3306"
+        }
+    }
+}
+// It doesn't make sense to start waiting until the attempt to start the db has been made.  Does not declare startDbWithoutWait 
+// as a dependency in case there is some build workflow that starts the db by some other means.
+tasks.waitForDbStart.mustRunAfter startDbWithoutWait
+
+task startDb(dependsOn: [startDbWithoutWait, waitForDbStart]) {
+}
+
+task stopDb(type: DockerStopContainer, dependsOn: checkIfDbRunning) {
+    targetContainerId { dockerDbContainerName }
+}
+tasks.stopDb.onlyIf { isDbRunning() }
+
+// This does not clean up the volumes, you might want to set up a cron job to do that automatically:
+//     http://blog.yohanliyanage.com/2015/05/docker-clean-up-after-yourself/
+task cleanDb(type: Exec, dependsOn: stopDb) {
+    commandLine 'docker', 'rm', dockerDbContainerName
+    ignoreExitValue = true
+}
+
+class CheckContainerExistenceResponseHandler implements ResponseHandler<Void, Boolean> {
+    @Override
+    Void handle(Boolean containerExists) {
+    }
+}
+
+class DockerCheckContainerExistence extends DockerExistingContainer {
+    private ResponseHandler<Void, Boolean> responseHandler = new CheckContainerExistenceResponseHandler()
+
+    @Override
+    void runRemoteCommand(dockerClient) {
+        try {
+            def container = dockerClient.inspectContainerCmd(getContainerId()).exec()
+            responseHandler.handle(container != null)
+        } catch (all) {
+            responseHandler.handle(false)
+        }
+    }
+
+    void setResponseHandler(ResponseHandler<Void, Boolean> responseHandler) {
+        this.responseHandler = responseHandler
+    }
+}
