@@ -8,7 +8,7 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath 'com.bmuschko:gradle-docker-plugin:2.6.6'
+        classpath 'com.bmuschko:gradle-docker-plugin:3.0.1'
     }
 }
 
@@ -46,6 +46,50 @@ String dockerHostUrl() {
     }
 }
 
+// Checks if a port is ready.  Returns true if the port is ready to send/receive data, and false if port is not yet listening
+def isPortReady(host, port) {
+    Socket s = null
+    try {
+        s = new Socket(host, port)
+        // If the code makes it this far without an exception it means
+        // something is using the port and has responded.
+        return true
+    } catch (IOException e) {
+        return false
+    } finally {
+        if(s != null) {
+            try {
+                s.close()
+            } catch (IOException e) {
+                throw new RuntimeException("You should handle this error, port may be stuck", e)
+            }
+        }
+    }
+}
+
+// Waits for a port to be ready until timeoutSeconds has passed
+def waitForPort(host, port, timeoutSeconds) {
+    println "waiting $timeoutSeconds seconds for $host:$port"
+    def startTime = System.currentTimeMillis()
+    def endWaitTime = startTime + timeoutSeconds*1000
+    boolean portReady = false
+    while (System.currentTimeMillis() < endWaitTime && !portReady) {
+        portReady = isPortReady(host, port)
+        if (portReady) {
+            break
+        } else {
+            Thread.sleep(100)
+        }
+    }
+    if (portReady) {
+        int elapsedSeconds = (System.currentTimeMillis() - startTime)/1000
+        println "$host:$port is available after $elapsedSeconds seconds"
+    } else {
+        println "timeout occurred after waiting $timeoutSeconds seconds for $host:$port"
+    }
+    return portReady
+}
+
 // Some gradle plugins create the build dir if it does not exist, but for our custom tasks we have to sometimes create it ourselves
 task ensureBuildDir() {
     doLast {
@@ -58,16 +102,15 @@ task ensureBuildDir() {
 }
 
 // Just checks if something is running on port 3306 and times out after 1 second
-task checkIfDbRunning(type: Exec) {
-    commandLine './scripts/wait-for-it.sh', '--timeout=1', 'localhost:3306'
-    ignoreExitValue = true
+task checkIfDbRunning() {
+    ext.isDbRunning = waitForPort('localhost', 3306, 1)
 }
 
 def isDbRunning() {
     if (!tasks.checkIfDbRunning.state.executed) {
-        throw new GradleException('isDbRunning() was called before checkIfDbRunning was run.')
+        logger.warn('isDbRunning() was called before checkIfDbRunning was run.')
     }
-    return tasks.checkIfDbRunning.execResult.exitValue == 0
+    return tasks.checkIfDbRunning.ext.isDbRunning
 }
 
 // If container already exists, skip download of image and container creation
@@ -131,13 +174,11 @@ task waitForDbStart(type: DockerInspectContainer) {
     targetContainerId { dockerDbContainerName }
     setResponseHandler { container ->
         def ip = container.networkSettings.ipAddress
-        exec {
-            // This checks port 3306 of the container rather than host machine.  This is because the port forwarding will be
-            // set up immediately on localhost even if the container has not yet exposed mariadb on port 3306.  If we check
-            // the localhost port 3306, it will be available immediately but mariadb will not be listening until it is
-            // initialized.
-            commandLine './scripts/wait-for-it.sh', '--timeout=1800', "$ip:3306"
-        }
+        // This checks port 3306 of the container rather than host machine.  This is because the port forwarding will be
+        // set up immediately on localhost even if the container has not yet exposed mariadb on port 3306.  If we check
+        // the localhost port 3306, it will be available immediately but mariadb will not be listening until it is
+        // initialized.
+        waitForPort(ip, 3306, 1800)
     }
 }
 // It doesn't make sense to start waiting until the attempt to start the db has been made.  Does not declare startDbWithoutWait 
@@ -152,11 +193,10 @@ task stopDb(type: DockerStopContainer, dependsOn: checkIfDbRunning) {
 }
 tasks.stopDb.onlyIf { isDbRunning() }
 
-// This does not clean up the volumes, you might want to set up a cron job to do that automatically:
-//     http://blog.yohanliyanage.com/2015/05/docker-clean-up-after-yourself/
-task cleanDb(type: Exec, dependsOn: stopDb) {
-    commandLine 'docker', 'rm', dockerDbContainerName
-    ignoreExitValue = true
+// Will error if container does not exist
+task cleanDb(type: DockerRemoveContainer, dependsOn: stopDb) {
+    targetContainerId { dockerDbContainerName }
+    removeVolumes true
 }
 
 class CheckContainerExistenceResponseHandler implements ResponseHandler<Void, Boolean> {
