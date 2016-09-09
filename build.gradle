@@ -23,6 +23,7 @@ defaultTasks 'startDb'
 
 docker {
     url = dockerHostUrl()
+    apiVersion = 1.23 // workaround to get java docker working on docker 1.12
 }
 
 URI dockerHostEnv() {
