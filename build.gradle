@@ -1,6 +1,8 @@
 import com.bmuschko.gradle.docker.response.ResponseHandler
 import com.bmuschko.gradle.docker.tasks.container.*
 import com.bmuschko.gradle.docker.tasks.image.*
+import com.mysql.jdbc.Driver
+import groovy.sql.Sql
 
 buildscript {
     repositories {
@@ -8,11 +10,39 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath 'com.bmuschko:gradle-docker-plugin:3.0.1'
+        classpath 'com.bmuschko:gradle-docker-plugin:3.0.3'
+        classpath 'mysql:mysql-connector-java:5.1.39'
     }
 }
 
 apply plugin: com.bmuschko.gradle.docker.DockerRemoteApiPlugin
+
+// https://github.com/bmuschko/gradle-docker-plugin/issues/235#issuecomment-239982250
+configurations {
+    dockerJava {
+        resolutionStrategy {
+            force 'de.gesellix:unix-socket-factory:2016-04-06T22-21-19'
+        }
+    }
+}
+
+
+def isDbReady(host, port) {
+    def db = [url:"jdbc:mysql://$host:$port/test_db", user:'testuser', password:'testpass', driver:'com.mysql.jdbc.Driver']
+    URLClassLoader loader = groovy.sql.Sql.class.classLoader
+    project.buildscript.configurations.classpath.each { File file ->
+        loader.addURL(file.toURL())
+    }
+    try {
+        def sql = groovy.sql.Sql.newInstance(db.url, db.user, db.password, db.driver)
+        return sql.execute('show databases')
+    } catch (all) {
+        return false
+    }
+}
+
+
+
 
 repositories {
     mavenLocal()
@@ -23,7 +53,6 @@ defaultTasks 'startDb'
 
 docker {
     url = dockerHostUrl()
-    apiVersion = 1.23 // workaround to get java docker working on docker 1.12
 }
 
 URI dockerHostEnv() {
@@ -41,7 +70,7 @@ String dockerHostUrl() {
             (new URI(uri.scheme != 'tcp' ?: 'https' , uri.userInfo, uri.host, uri.port, uri.path, uri.query, uri.fragment)).toString()
         }
     } else {
-        org.gradle.internal.os.OperatingSystem.current().isLinux()
+        (org.gradle.internal.os.OperatingSystem.current().isLinux() || org.gradle.internal.os.OperatingSystem.current().isMacOsX())
                 ? 'unix:///var/run/docker.sock'
                 : 'http://localhost:2375'
     }
@@ -85,6 +114,28 @@ def waitForPort(host, port, timeoutSeconds) {
     if (portReady) {
         int elapsedSeconds = (System.currentTimeMillis() - startTime)/1000
         println "$host:$port is available after $elapsedSeconds seconds"
+    } else {
+        println "timeout occurred after waiting $timeoutSeconds seconds for $host:$port"
+    }
+    return portReady
+}
+
+def waitForDb(host, port, timeoutSeconds) {
+    println "waiting $timeoutSeconds seconds for database to be ready on $host:$port"
+    def startTime = System.currentTimeMillis()
+    def endWaitTime = startTime + timeoutSeconds*1000
+    boolean portReady = false
+    while (System.currentTimeMillis() < endWaitTime && !portReady) {
+        portReady = isDbReady(host, port)
+        if (portReady) {
+            break
+        } else {
+            Thread.sleep(100)
+        }
+    }
+    if (portReady) {
+        int elapsedSeconds = (System.currentTimeMillis() - startTime)/1000
+        println "Database at $host:$port is available after $elapsedSeconds seconds"
     } else {
         println "timeout occurred after waiting $timeoutSeconds seconds for $host:$port"
     }
@@ -174,12 +225,7 @@ tasks.startDbWithoutWait.onlyIf { !isDbRunning() }
 task waitForDbStart(type: DockerInspectContainer) {
     targetContainerId { dockerDbContainerName }
     setResponseHandler { container ->
-        def ip = container.networkSettings.ipAddress
-        // This checks port 3306 of the container rather than host machine.  This is because the port forwarding will be
-        // set up immediately on localhost even if the container has not yet exposed mariadb on port 3306.  If we check
-        // the localhost port 3306, it will be available immediately but mariadb will not be listening until it is
-        // initialized.
-        waitForPort(ip, 3306, 1800)
+        waitForDb('localhost', 3306, 1800)
     }
 }
 // It doesn't make sense to start waiting until the attempt to start the db has been made.  Does not declare startDbWithoutWait 
